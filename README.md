@@ -86,7 +86,7 @@
       - activation(optional): relu, sigmoid, tanh, elu, softmax, log_softmax. Softmaxes are applied on the last dimension. If no value is given, no activation      function is applied after the einsum is computed.
 
 - To declare a loss, a loss line has to be writen as:
-  - _loss :- TensorName1[range_dim_0, range_dim_1, ...]TensorName1[range_dim_0, range_dim_1, ...] flag_1_key=flag_1_value flag_2_key=flag_2_value_
+  - _loss :- RHS1[range_dim_0, range_dim_1, ...]RHS2[range_dim_0, range_dim_1, ...] flag_1_key=flag_1_value flag_2_key=flag_2_value_
   - e.g: 
     - _loss :- Output[x, y]Label[x, y] loss=nll name=loss_
   - Note: see the tensor indexing rules above.
