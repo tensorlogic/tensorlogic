@@ -1,0 +1,34 @@
+tensor Input shape=(16, 784)
+
+tensor W1 shape=(50, 784)
+tensor W2 shape=(10, 50)
+
+tensor PA1 shape=(16, 50)
+tensor PA2 shape=(16, 10)
+
+tensor A1 shape=(16, 50)
+tensor A2 shape=(16, 10)
+
+tensor B1 shape=(16, 50)
+tensor B2 shape=(16, 10)
+
+tensor Labels shape=(16, 10)
+
+input Input[batch, features] :- type=data
+input Labels[batch] :- type=label
+
+weight W1[features, prev_activ] :- initializer=xavier_normal gain=1.0
+weight W2[features, prev_activ] :- initializer=xavier_normal gain=1.0
+
+weight B1[batch, features] :- initializer=uniform from=-0.1 to=0.1 batch_dim=0
+weight B2[batch, features] :- initializer=uniform from=-0.1 to=0.1 batch_dim=0
+
+einsum PA1[batch, x] :- W1[x, y]Input[batch, y]
+einsum PA1[batch, x] :- B1[batch, x]
+einsum A1[batch, x] :- PA1[batch, x] activation=sigmoid
+
+einsum PA2[batch, x] :- W2[x, y]A1[batch, y]
+einsum PA2[batch, x] :- B2[batch, x]
+einsum A2[batch, x] :- PA2[batch, x] activation=log_softmax
+
+loss :- A2[batch,x]Labels[batch] loss=nll name=loss

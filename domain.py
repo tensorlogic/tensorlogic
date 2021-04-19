@@ -1,70 +1,102 @@
+import numpy as np
+import sparse as sp
+import torch
+
 from sortedcontainers import SortedDict
 from functools import partial
 from collections import defaultdict
 from collections.abc import Iterable
 from itertools import product, chain
-import numpy as np
-import sparse as sp
 
-from range import IntRange, SliceRange, SetRange, CoordsRange, DummyRange, range_comp_binary, equality_range
-from misc import min_function_binary, max_function_binary, min_max_function, power_set, reduce_concat
+from range import IntRange, SliceRange, SetRange, CoordRange, DummyRange, range_comp_binary
+from misc import min_function_binary, max_function_binary, min_max_function, power_set
 
 
 class Domain(object):
+    """
+    A Domain object is used to represent the domain of discourse over which a subtensor runs. More specifically,
+    the Domain object will store the parts of the tensor to which a certain subtensor refers to. During backward
+    chaining, the domain will store the parts of the tensor being queried. During the forward computation, the Domain
+    will be used to index into pytorch tensors in order to update or select the data from the appropriate memory
+    locations.
+
+    The Domain object has as many dimensions as the tensor which it indexes. For each dimension, it has a
+    corresponding range or one dimension of a CoordRange(the CoordRanges can span across multiple domain dimensions).
+    The map between tensor dimensions and the ranges is stored in indexed_ranges.
+
+    The Domain stores the CoordRanges in the coords field, separate from the rest of the ranges which are stored
+    in the slices field(the slice dimensions will contain either IntRanges, SliceRanges, SetRanges, DummyRanges).
+    """
 
     def __init__(self, coords, slices, coord_dims, slice_dims, shape):
 
+        """
+        Creates a Domain object.
+        :param coords: tuple[CoordRange], list[CoordRange]
+            list-like containing the CoordRanges that the Domain contains.
+        :param slices: tuple[Range], list[Range]
+            list-like containing the Ranges(all except CoordRanges) that the Domain contains.
+        :param coord_dims: tuple[tuple], list[tuple]
+            list-like containing the dimensions of the tensors over which the coords run given as tuples.
+            The i-th entry in coords must match the i-th entry in coord_dims. We use tuples because CoordRanges
+            generally refer to multiple tensor dimensions.
+        :param slice_dims: tuple[int], list[int]
+            list-like containing the dimensions of the tensors over which the slices run given as integers.
+            The i-th entry in slices must match the i-th entry in slice_dims. We use integers because slice ranges will
+            refer to one single tensor dimension.
+        :param shape: tuple[int], list[int]
+            the shape of the tensor over which the Domain runs.
+        """
         super(Domain, self).__init__()
 
-        self.shape = shape
+        self.shape = tuple(shape)
         self.ndim = len(shape)
 
-        coord_dims = coord_dims or ()
-        slice_dims = slice_dims or ()
+        self.coord_dims, self.coords = tuple(coord_dims or ()), tuple(coords or ())
+        self.slice_dims, self.slices = tuple(slice_dims or ()), tuple(slices or ())
 
-        coords_dict = SortedDict(zip((tuple(coo_dims) for coo_dims in coord_dims), coords))
-        slices_dict = SortedDict(zip(slice_dims, slices))
-
-        self.coord_dims, self.coords = tuple(coords_dict.keys()), tuple(coords_dict.values())
-        self.coord_dims_flat = tuple(sorted(reduce_concat(self.coord_dims)))
-        self.slice_dims, self.slices = tuple(slices_dict.keys()), tuple(slices_dict.values())
-
+        # inverse map from the id of the coords and slices to the tensor dimensions they represent.
         self.coord_dims_map = {id(coords): dims for coords, dims in zip(self.coords, self.coord_dims)}
         self.slice_dims_map = {id(sl): dim for sl, dim in zip(self.slices, self.slice_dims)}
 
+        # create the indexed_ranges. Sort the dimensions using a Sorted dictionary. Only keep the values at the end.
+        # each item in indexed_range is a tuple (Range, int) where the integer represents the dimension within the range
+        # that the dimension in the domain refers to. For slices, this is always 0 since slices represent only one
+        # dimension. For coords, they run from 0 to the ndim of the CoordRange.
         dims = SortedDict()
-
         for coords, coord_dims in zip(self.coords, self.coord_dims):
             for i, d in enumerate(coord_dims):
-                if coords.shape is not None:
-                    assert coords.shape[i] == self.shape[d]
                 dims[d] = (coords, i)
-            if coords.shape is None:
-                coords.shape = tuple(self.get_shape(coord_dims))
-
+            coords.shape = tuple(self.get_shape(coord_dims))
         for sl, d in zip(self.slices, self.slice_dims):
-            if sl.shape is not None:
-                assert sl.shape == self.shape[d]
-            else:
-                sl.shape = self.shape[d]
+            sl.shape = self.shape[d]
             dims[d] = (sl, 0)
-
         self.indexed_ranges = tuple(dims.values())
-        self.range_dims_map = {id(r): dim for r, dim in zip(chain(self.slices, self.coords), chain(self.slice_dims, self.coord_dims))}
 
         self.dummy = all(isinstance(r, DummyRange) for r in self.get_ranges())
-        self._sparse_value = None
 
     @staticmethod
     def domain_from_ranges(ranges, shape):
 
-        slices, coords, coords_id, coords_idx = SortedDict(), SortedDict(), {}, defaultdict(lambda: ([], []))
+        """
+        Given a tuple of (Range, int) objects or Nones(which correspond to DummyRanges) and the shape of the tensor,
+        create a Domain. The ranges tuple should contain what will become the indexed_ranges of the new Domain.
+        The CoordRanges given as input must not necessarily contain all the dimensions of the CoordRange and only the
+        dimensions indicated in the input tuple will be selected
+        :param ranges: tuple[(Range, int), (None, int)]
+            The ranges and the dimension of each range placed in a tuple such that the i-th entry of the tuple
+            corresponds to the i-th dimension of the tensor. None values are treated as DummyRanges.
+        :param shape: tuple[int], list[int]
+            the shape of the tensor over which the Domain runs.
+        :return: Domain
+        """
+        slices, coords, coords_id, coords_idx = {}, {}, {}, defaultdict(lambda: ([], []))
 
         for idx, (r, c_idx) in enumerate(ranges):
 
             if r is None:
                 slices[idx] = DummyRange()
-            elif r.is_slice:
+            elif not r.is_coord:
                 slices[idx] = r
             else:
                 r_id = id(r)
@@ -84,34 +116,55 @@ class Domain(object):
 
     @staticmethod
     def domain_from_dicts(coords, slices, shape):
-
-        coords, coord_dims = tuple(coords.values()), tuple(coords.keys())
-        slices, slice_dims = tuple(slices.values()), tuple(slices.keys())
-        return Domain(coords, slices, coord_dims, slice_dims, shape)
+        """
+        Create a Domain from a dictionary of slices and tuples. The keys will be the dimensions to which the
+        Ranges correspond to(ints for slices, tuples for coords).
+        :param coords: dict[tuple, CoordRange]
+        :param slices: dict[int, Range]
+        :param shape: tuple[int], list[int]
+        :return: Domain
+        """
+        return Domain(tuple(coords.values()), tuple(slices.values()), tuple(coords.keys()), tuple(slices.keys()), shape)
 
     @staticmethod
     def domain_from_query_data(domain_tuple, domain_vals, shape):
+        """
+        Create a Domain from query data. Query data consists of a domain tuple which has the same format as the
+        tensor indexing in the program declaration and the domain_vals is a dictionary matching the names in the
+        domain_tuple to values.
+        The type of ranges will be inferred from the values:
+            None -> DummyRange
+            int -> IntRange
+            1d array-like -> SetRange
+            nd array-like -> CoordRange
+            slice -> SliceRange
+        :param domain_tuple: tuple[str], list[str]
+        :param domain_vals: dict[str, [None, integer-like, slice, Iterable]]
+        :param shape: tuple[int], list[int]
+        :return: Domain
+        """
 
         coords, slices = {}, {}
         coord_dims, slice_dims = defaultdict(list), {}
 
+        # infer the type of range from the value
         for key, val in domain_vals.items():
-
-            if isinstance(val, (int, np.integer)):
+            if isinstance(val, (int, np.integer, torch.IntType)):
                 slices[key] = IntRange(value=val)
             elif isinstance(val, slice):
                 slices[key] = SliceRange(value=val)
             elif isinstance(val, Iterable):
-                val = np.array(val, np.long)
+                val = np.array(val, np.long) if not isinstance(val, torch.Tensor) else val
                 if val.ndim == 1:
                     slices[key] = SetRange(value=val)
                 else:
-                    coords[key] = CoordsRange(ndim=val.ndim, value=val)
+                    coords[key] = CoordRange(ndim=val.ndim, value=val)
             elif val is None:
                 slices[key] = DummyRange()
             else:
                 raise ValueError("Wrong query val type", type(val))
 
+        # match the range to the name
         for dim, range_name in enumerate(domain_tuple):
             range_name = range_name.split(".")
             if len(range_name) == 1:
@@ -125,28 +178,34 @@ class Domain(object):
                       slice_dims=(slice_dims[k] for k in slices.keys()),
                       shape=shape)
 
-    # ############### GET STUFF ##################
-
     @property
-    def empty(self): return any(r.empty for r in chain(self.slices, self.coords))
-    def get_all_constant(self, indices=None): return all(self.get_constant(indices))
-    def get_constant(self, indices=None): return (r.constant for r in self.get_ranges(indices))
-    def get_indexed_ranges(self, indices=None): return (self.indexed_ranges[idx] for idx in indices) if indices is not None else iter(self.indexed_ranges)
-    def get_ranges(self, indices=None): return (self.indexed_ranges[idx][0] for idx in indices) if indices is not None else (d[0] for d in self.indexed_ranges)
-    def get_shape(self, indices=None): return (self.shape[idx] for idx in indices) if indices is not None else iter(self.shape)
-    def get_range_types(self, indices=None): return (type(r) for r in self.get_ranges(indices))
-    def get_values(self, indices=None): return (r.value for r in self.get_ranges(indices))
-    def get_sparse_values(self, indices=None): return (r.sparse_value for r in self.get_ranges(indices))
-    def get_torch_values(self, indices=None): return (r.torch_value for r in self.get_ranges(indices))
+    def empty(self):
+        return any(r.empty for r in chain(self.slices, self.coords))
 
-    # ############### COMPUTE VALUES ##################
+    def get_indexed_ranges(self, indices=None):
+        return (self.indexed_ranges[idx] for idx in indices) if indices is not None else iter(self.indexed_ranges)
 
-    def _get_coords_reshape(self, coord_range, group):
+    def get_ranges(self, indices=None):
+        return (self.indexed_ranges[idx][0] for idx in indices) if indices is not None else (d[0] for d in self.indexed_ranges)
+
+    def get_shape(self, indices=None):
+        return (self.shape[idx] for idx in indices) if indices is not None else iter(self.shape)
+
+    def get_range_types(self, indices=None):
+        return (type(r) for r in self.get_ranges(indices))
+
+    def get_values(self, indices=None):
+        return (r.value for r in self.get_ranges(indices))
+
+    def get_sparse_values(self, indices=None):
+        return (r.sparse_value for r in self.get_ranges(indices))
+
+    def _get_coords_reshape(self, coord_range, dims):
 
         coord_dims = iter(self.coord_dims_map[id(coord_range)])
         cur_coord_dim, coord_dims_found = next(coord_dims), 0
 
-        for idx in group:
+        for idx in dims:
             if idx == cur_coord_dim:
                 yield coord_range.shape[coord_dims_found]
                 cur_coord_dim = next(coord_dims, None)
@@ -154,50 +213,60 @@ class Domain(object):
             else:
                 yield 1
 
-        assert cur_coord_dim is None, "All the dimensions of the coordinate range have to be included in the group"
+    def _get_reshape(self, dims=None):
 
-    def get_reshape(self, group=None):
-
-        group = group if group is not None else range(self.ndim)
+        dims = dims if dims is not None else range(self.ndim)
         num_slices, num_coords = 0, 0
         reshapes = []
 
-        for idx, (r, c_idx) in enumerate(self.get_indexed_ranges(group)):
+        for idx, (r, c_idx) in enumerate(self.get_indexed_ranges(dims)):
 
-            if r.is_slice:
+            if not r.is_coord:
                 num_slices += 1
                 if not r.is_dummy:
-                    reshapes.append(tuple(r.shape if i == idx else 1 for i in range(len(group))))
+                    reshapes.append(tuple(r.shape if i == idx else 1 for i in range(len(dims))))
             elif c_idx == 0:
                 num_coords += 1
-                reshapes.append(tuple(self._get_coords_reshape(r, group)))
+                reshapes.append(tuple(self._get_coords_reshape(r, dims)))
 
         return tuple(reshapes) if num_coords + num_slices > 1 else (None, )
 
-    def group_ranges(self, group=None, reshapes=None):
+    def join_ranges(self, dims=None):
 
-        reshapes = iter(reshapes) if reshapes else iter(self.get_reshape(group))
+        """
+        Joins the given dimensions of the domain. In order to do so, we use the sparse values of the ranges to join.
+        The shape of the ranges' sparse values is broadcast in such a way that the sparse.COO arrays involved in the
+        join will have the same ndim as the final joined sparse.COO array. The join is performed by
+        multiplication(bitwise and) of the sparse arrays. Return True if all the ranges involved are dummies.
+        :param dims: tuple[int], list[int]
+        :return: sparse.COO 
+        """
 
+        reshapes = iter(self._get_reshape(dims))
         value = True
 
-        for r, c_idx in self.get_indexed_ranges(group):
+        for r, c_idx in self.get_indexed_ranges(dims):
 
             if not r.is_dummy and c_idx == 0:
 
-                r_sparse = r.sparse_value
-
                 resh = next(reshapes)
                 if resh is not None:
-                    r_sparse = r_sparse.reshape(resh)
+                    r_sparse = r.sparse_value.reshape(resh)
+                else:
+                    r_sparse = r.sparse_value
 
-                value = r_sparse if value is True else value * r_sparse
+                value = r_sparse if value is True else value & r_sparse
 
         return value
 
 
-def domain_comp_binary(d1, d2, group=None):
+# compare two domains. Return -1 if d1 contains d2, 1 if vice-versa, 0 if the two are equal, and None if the two domains
+# are not comparable. For now, the check is fairly restricted and only if two ranges are the same or if one range is a
+# DummyRange can containment be established for ranges. If containment can be established for all ranges, and is
+# consistent across the whole domain, only then can the comparison be performed.
+def domain_comp_binary(d1, d2, dims=None):
 
-    ranges = zip(d1.get_ranges(group), d2.get_ranges(group))
+    ranges = zip(d1.get_ranges(dims), d2.get_ranges(dims))
     comp = range_comp_binary(*next(ranges))
 
     if comp is not None:
@@ -213,21 +282,15 @@ def domain_comp_binary(d1, d2, group=None):
     return comp
 
 
+# other comparison functions
 max_domain_binary = partial(max_function_binary, domain_comp_binary)
 max_domain = partial(min_max_function, max_domain_binary)
 
 min_domain_binary = partial(min_function_binary, domain_comp_binary)
 min_domain = partial(min_max_function, min_domain_binary)
 
-scalar_domain = Domain((), (), (), (), ())
 
-
-# an assumption made here is that the same coords range must run over the same dimensions of a tensor!!
-def equal_domain_dims(domains):
-    eq_domains = tuple(equality_range(*ranges) for ranges in zip(*(d.get_ranges() for d in domains)))
-    return tuple(i for i, eq in enumerate(eq_domains) if eq), tuple(i for i, eq in enumerate(eq_domains) if not eq)
-
-
+# generate random domains. Test purposes
 def generate_domains(pairs=False):
 
     ndims = 5
@@ -255,7 +318,7 @@ def generate_domains(pairs=False):
             if isinstance(i, int):
                 t = np.random.choice((IntRange, SetRange, SliceRange, DummyRange))
             else:
-                t = CoordsRange
+                t = CoordRange
 
         if t == IntRange:
             return t(value=sample_int(i))
@@ -265,7 +328,7 @@ def generate_domains(pairs=False):
             return t(value=sample_sls(i))
         elif t == DummyRange:
             return DummyRange()
-        elif t == CoordsRange:
+        elif t == CoordRange:
             return t(ndim=len(i), value=sample_coords(i))
 
     def sample_new_dims(other_dom):
@@ -286,7 +349,7 @@ def generate_domains(pairs=False):
             if np.random.random() > 0.5:
                 coos.append(dim)
             else:
-                coos.append(sample_range(CoordsRange, cd))
+                coos.append(sample_range(CoordRange, cd))
             coo_dims.append(cd)
 
         d = Domain(coos, sls, coo_dims, sl_dims, shape_)
@@ -346,10 +409,10 @@ def generate_domains(pairs=False):
         coos, sls = SortedDict(), SortedDict()
 
         if coord1_dims:
-            coos[coord1_dims] = sample_range(CoordsRange, coord1_dims)
+            coos[coord1_dims] = sample_range(CoordRange, coord1_dims)
 
         if coord2_dims:
-            coos[coord2_dims] = sample_range(CoordsRange, coord2_dims)
+            coos[coord2_dims] = sample_range(CoordRange, coord2_dims)
 
         for idx in range(0, ndims):
 
@@ -418,8 +481,8 @@ if __name__ == "__main__":
                SliceRange(value=slice(5, None), shape=10),
                DummyRange())
 
-    coords_ = (CoordsRange(value=[[3, 4, 5], [13, 14, 15]], shape=(10, 20), ndim=2),
-               CoordsRange(value=[[13, 14, 15], [23, 24, 25]], ndim=2))
+    coords_ = (CoordRange(value=[[3, 4, 5], [13, 14, 15]], shape=(10, 20), ndim=2),
+               CoordRange(value=[[13, 14, 15], [23, 24, 25]], ndim=2))
 
     d = Domain(coords_, slices_, coord_dims=((0, 3), (1, 5)), slice_dims=(2, 4, 6, 7, 8),
                shape=(10, 20, 10, 20, 10, 30, 10, 10, 10))
@@ -448,8 +511,8 @@ if __name__ == "__main__":
                     if g == dims[0]:
                         c_dims.append([gr.index(d) for d in dims])
 
-    d1 = Domain((CoordsRange(ndim=2), ), (), ((0, 1), ), (), shape=(10, 20))
-    d2 = Domain((CoordsRange(ndim=2), ), (), ((0, 1), ), (), shape=(10, 20))
+    d1 = Domain((CoordRange(ndim=2),), (), ((0, 1),), (), shape=(10, 20))
+    d2 = Domain((CoordRange(ndim=2),), (), ((0, 1),), (), shape=(10, 20))
     d3 = Domain((), (DummyRange(), DummyRange()), (), (0, 1), shape=(10, 20))
     d4 = Domain((), (DummyRange(), DummyRange()), (), (0, 1), shape=(10, 20))
     d5 = Domain((), (SetRange(), DummyRange()), (), (0, 1), shape=(10, 20))

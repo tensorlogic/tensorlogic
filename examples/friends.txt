@@ -1,0 +1,51 @@
+range set drinkers
+range set smokers
+range coords friends ndim=2
+range set stressed
+
+tensor Drinks_init shape=(50)
+tensor Smokes_init shape=(50)
+tensor Friends_init shape=(50, 50)
+tensor Stressed_init shape=(50)
+tensor Friends shape=(50, 50)
+tensor Stressed shape=(50)
+tensor Smokes shape=(50)
+tensor Drinks shape=(50)
+tensor Cancer shape=(50)
+tensor CancerFriends shape=(50, 50)
+tensor DrinksFriends shape=(50, 50)
+tensor SmokesFriends shape=(50, 50)
+tensor StressedFriends shape=(50, 50)
+tensor Smokes_weight shape=()
+tensor Drinks_weight shape=()
+tensor Stressed_weight shape=()
+
+constant Drinks_init[drinkers] :-
+constant Smokes_init[smokers] :-
+constant Friends_init[friends.0, friends.1] :-
+constant Stressed_init[stressed] :-
+constant Smokes_weight[] :-
+constant Drinks_weight[] :-
+constant Stressed_weight[] :-
+
+einsum Friends[x, y] :- Friends_init[x, z]Friends_init[z, y]
+
+einsum Stressed[x] :- Friends[x, y]Stressed_init[y]
+einsum Stressed[x] :- Stressed_init[x]
+
+einsum Smokes[x] :- Friends[x, y]Smokes_init[y]
+einsum Smokes[x] :- Smokes_init[x]
+einsum Smokes[x] :- Stressed[x]
+
+einsum Drinks[x] :- Friends[x, y]Drinks_init[y]
+einsum Drinks[x] :- Drinks_init[x]
+einsum Drinks[x] :- Stressed[x]
+
+einsum Cancer[x] :- Smokes_weight[]Smokes[x]
+einsum Cancer[x] :- Drinks_weight[]Drinks[x]
+einsum Cancer[x] :- Stressed_weight[]Stressed[x]
+
+einsum CancerFriends[x, y] :- Cancer[x]Cancer[y]Friends[x, y]
+einsum DrinksFriends[x, y] :- Drinks[x]Drinks[y]Friends[x, y]
+einsum SmokesFriends[x, y] :- Smokes[x]Smokes[y]Friends[x, y]
+einsum StressedFriends[x, y] :- Stressed[x]Stressed[y]Friends[x, y]
