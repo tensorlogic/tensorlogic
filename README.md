@@ -83,7 +83,7 @@
   - Note: The tensors in the rule have to have been declared before a rule using the tensor is created.
   - Note: A tensor index on the LHS has to appear on the RHS. The opposite is not true as these dimensions will be projected.
   - Note: the only flag an einsum rule has is an activation:
-      - activation(optional): relu, sigmoid, tanh, elu, softmax, log_softmax. Softmaxes are applied on the last dimension. If no value is given, no activation      function is applied after the einsum is computed.
+      - activation(optional): _relu_, _sigmoid_, _tanh_, _elu_, _softmax_, _log_softmax_. Softmaxes are applied on the last dimension. If no value is given, no activation function is applied after the einsum is computed.
 
 - To declare a loss, a loss line has to be writen as:
   - _loss :- RHS1[range_dim_0, range_dim_1, ...]RHS2[range_dim_0, range_dim_1, ...] flag_1_key=flag_1_value flag_2_key=flag_2_value_
@@ -92,3 +92,7 @@
   - Note: see the tensor indexing rules above.
   - Note: The tensors in the loss have to have been declared before the loss is created.
   - Note: The ranges in the loss need not match as long the tensors obtained after slicing the tensors on RHS have the shapes expected by the torch loss.
+  - Note: A loss line accepts the following flags:
+    - name(required): str. Unique identifier of the loss that the user can use the access the loss.
+    - loss(required): str. Unique identifier of the type of torch loss to compute.
+    - other flags required by the torch losses. See torch documentation for these.
